@@ -21,11 +21,11 @@ def _bootstrap():
         sys.exit(1)
 
     missing = [
-        pkg for pkg in ("customtkinter", "PIL")
+        pkg for pkg in ("customtkinter", "PIL", "cv2")
         if importlib.util.find_spec(pkg) is None
     ]
-    # PIL é o nome do módulo; o pacote pip é pillow
-    pip_names = {"PIL": "pillow"}
+    # nomes de módulo → pacote pip
+    pip_names = {"PIL": "pillow", "cv2": "opencv-python-headless"}
 
     if missing:
         try:
@@ -75,6 +75,7 @@ import webbrowser
 from pathlib import Path
 from typing import Callable, Optional
 
+import tkinter as tk
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 try:
@@ -587,6 +588,379 @@ def _parse_time(s: str) -> Optional[float]:
     return h * 3600 + mi * 60 + sec
 
 
+def _fmt_time(t: float) -> str:
+    """Float de segundos → 'm:ss' ou 'h:mm:ss'."""
+    t = int(max(0.0, t))
+    h, m, s = t // 3600, (t % 3600) // 60, t % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAYER INTERATIVO DE RECORTE
+# ══════════════════════════════════════════════════════════════════════════════
+try:
+    import cv2 as _cv2       # type: ignore
+    _CV2_OK = True
+except ImportError:
+    _CV2_OK = False
+
+_PDISP_W  = 640   # largura do preview de vídeo
+_PDISP_H  = 360   # altura  do preview de vídeo
+_TL_H     = 72    # altura do canvas de timeline
+_TL_PAD   = 20    # margem horizontal da barra
+
+
+class VideoTrimDialog:
+    """
+    Dialog modal com player interativo para escolha de ponto de recorte.
+    Requer opencv-python-headless (instalado pelo bootstrap).
+    .result → (start_s, end_s) ou None se cancelado.
+    """
+
+    def __init__(
+        self,
+        parent: ctk.CTk,
+        ffmpeg_path: str,
+        input_path: str,
+        duration_s: float,
+        initial_start: float = 0.0,
+        initial_end: Optional[float] = None,
+    ):
+        self.result: Optional[tuple[float, float]] = None
+
+        if not _CV2_OK:
+            messagebox.showerror(
+                "Player não disponível",
+                "opencv-python-headless não está instalado.\n"
+                "Execute:  pip install opencv-python-headless",
+            )
+            return
+
+        self.duration_s    = max(duration_s, 0.001)
+        self.trim_start    = float(initial_start)
+        self.trim_end      = float(initial_end if initial_end is not None else duration_s)
+        self._current_time = 0.0
+        self._playing      = False
+        self._drag_what: Optional[str] = None
+        self._after_id     = None
+
+        self.cap = _cv2.VideoCapture(str(input_path))
+        if not self.cap.isOpened():
+            messagebox.showerror("Erro", f"Não foi possível abrir:\n{input_path}")
+            return
+
+        raw_fps    = self.cap.get(_cv2.CAP_PROP_FPS)
+        self.fps   = raw_fps if raw_fps and raw_fps > 0 else 25.0
+
+        # ── Janela ────────────────────────────────────────────────────────────
+        self._win = ctk.CTkToplevel(parent)
+        self._win.title(f"Recortar — {Path(input_path).name}")
+        self._win.resizable(False, False)
+        self._win.transient(parent)
+        self._win.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        self._build_ui()
+
+        # Centraliza sobre o pai
+        self._win.update_idletasks()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_x(), parent.winfo_y()
+        dw, dh = 680, 634
+        self._win.geometry(f"{dw}x{dh}+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
+
+        self._seek(self.trim_start)
+
+        self._win.focus_force()
+        self._win.bind("<space>",        lambda e: self._toggle_play())
+        self._win.bind("<Left>",         lambda e: self._seek(self._current_time - 2))
+        self._win.bind("<Right>",        lambda e: self._seek(self._current_time + 2))
+        self._win.bind("<Shift-Left>",   lambda e: self._seek(self._current_time - 10))
+        self._win.bind("<Shift-Right>",  lambda e: self._seek(self._current_time + 10))
+
+        self._win.grab_set()
+        self._win.wait_window()
+
+    # ── Construção ────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        win = self._win
+        win.grid_columnconfigure(0, weight=1)
+
+        # Preview de vídeo
+        self._video_label = ctk.CTkLabel(
+            win, text="Carregando...",
+            width=_PDISP_W, height=_PDISP_H,
+            fg_color="black", corner_radius=0,
+        )
+        self._video_label.grid(row=0, column=0, padx=20, pady=(14, 0))
+
+        # Timeline canvas (tk nativo — sem CTkCanvas)
+        self._canvas = tk.Canvas(
+            win, width=_PDISP_W, height=_TL_H,
+            bg="#1a1a1a", highlightthickness=0,
+        )
+        self._canvas.grid(row=1, column=0, padx=20, pady=(8, 0))
+        self._canvas.bind("<Button-1>",        self._on_press)
+        self._canvas.bind("<B1-Motion>",       self._on_drag)
+        self._canvas.bind("<ButtonRelease-1>", self._on_release)
+
+        # Controles de reprodução
+        ctrl = ctk.CTkFrame(win, fg_color="transparent")
+        ctrl.grid(row=2, column=0, padx=20, pady=(6, 0), sticky="ew")
+        ctrl.grid_columnconfigure(1, weight=1)
+
+        btns = ctk.CTkFrame(ctrl, fg_color="transparent")
+        btns.grid(row=0, column=0)
+        for label, delta in [("-10s", -10), ("-2s", -2)]:
+            ctk.CTkButton(
+                btns, text=label, width=52, height=32,
+                fg_color="transparent", border_width=1,
+                command=lambda d=delta: self._seek(self._current_time + d),
+            ).pack(side="left", padx=2)
+        self._btn_play = ctk.CTkButton(
+            btns, text="▶  Play", width=100, height=32,
+            command=self._toggle_play,
+        )
+        self._btn_play.pack(side="left", padx=2)
+        for label, delta in [("+2s", 2), ("+10s", 10)]:
+            ctk.CTkButton(
+                btns, text=label, width=52, height=32,
+                fg_color="transparent", border_width=1,
+                command=lambda d=delta: self._seek(self._current_time + d),
+            ).pack(side="left", padx=2)
+
+        self._lbl_time = ctk.CTkLabel(
+            ctrl, text="0:00 / 0:00",
+            font=ctk.CTkFont(family="Courier", size=12),
+        )
+        self._lbl_time.grid(row=0, column=1, sticky="e")
+
+        # Botões de snap (posição atual → marcador)
+        snap = ctk.CTkFrame(win, fg_color="transparent")
+        snap.grid(row=3, column=0, padx=20, pady=(6, 0), sticky="ew")
+        snap.grid_columnconfigure((0, 1), weight=1)
+
+        ctk.CTkButton(
+            snap, text="⬤  Marcar início aqui", height=34,
+            fg_color="transparent", border_width=1, text_color="#4fc3f7",
+            command=self._snap_start,
+        ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
+        ctk.CTkButton(
+            snap, text="Marcar fim aqui  ⬤", height=34,
+            fg_color="transparent", border_width=1, text_color="#f07b3f",
+            command=self._snap_end,
+        ).grid(row=0, column=1, padx=(4, 0), sticky="ew")
+
+        # Ações
+        actions = ctk.CTkFrame(win, fg_color="transparent")
+        actions.grid(row=4, column=0, padx=20, pady=(8, 16), sticky="ew")
+        actions.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(
+            actions, text="✗  Cancelar", height=42,
+            fg_color="transparent", border_width=1,
+            command=self._on_cancel,
+        ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        ctk.CTkButton(
+            actions, text="✓  Confirmar recorte", height=42,
+            command=self._on_confirm,
+        ).grid(row=0, column=1, padx=(6, 0), sticky="ew")
+
+    # ── Reprodução ────────────────────────────────────────────────────────────
+
+    def _toggle_play(self):
+        if self._playing:
+            self._playing = False
+            self._btn_play.configure(text="▶  Play")
+        else:
+            if self._current_time >= self.trim_end - 0.1:
+                self._seek(self.trim_start)
+            self._playing = True
+            self._btn_play.configure(text="⏸  Pausar")
+            self._play_step()
+
+    def _play_step(self):
+        if not self._playing:
+            return
+        ret, frame = self.cap.read()
+        if not ret:
+            self._playing = False
+            self._btn_play.configure(text="▶  Play")
+            return
+
+        pos = self.cap.get(_cv2.CAP_PROP_POS_MSEC) / 1000.0
+        self._current_time = pos
+
+        if pos >= self.trim_end:
+            self._playing = False
+            self._btn_play.configure(text="▶  Play")
+            self._seek(self.trim_end)
+            return
+
+        self._show_frame(frame)
+        self._draw_timeline()
+        self._update_time_label()
+        self._after_id = self._win.after(max(1, int(1000 / self.fps)), self._play_step)
+
+    def _seek(self, time_s: float):
+        was_playing = self._playing
+        if self._playing:
+            self._playing = False
+            self._btn_play.configure(text="▶  Play")
+        if self._after_id:
+            self._win.after_cancel(self._after_id)
+            self._after_id = None
+
+        self._current_time = max(0.0, min(self.duration_s, time_s))
+        self.cap.set(_cv2.CAP_PROP_POS_MSEC, self._current_time * 1000)
+        ret, frame = self.cap.read()
+        if ret:
+            self._show_frame(frame)
+        self._draw_timeline()
+        self._update_time_label()
+
+    def _show_frame(self, frame_bgr):
+        try:
+            h, w  = frame_bgr.shape[:2]
+            scale = min(_PDISP_W / w, _PDISP_H / h)
+            nw = max(1, int(w * scale))
+            nh = max(1, int(h * scale))
+
+            frame_rgb = _cv2.cvtColor(frame_bgr, _cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame_rgb).resize((nw, nh), Image.LANCZOS)
+
+            canvas_img = Image.new("RGB", (_PDISP_W, _PDISP_H), (0, 0, 0))
+            canvas_img.paste(img, ((_PDISP_W - nw) // 2, (_PDISP_H - nh) // 2))
+
+            ctk_img = ctk.CTkImage(canvas_img, size=(_PDISP_W, _PDISP_H))
+            self._video_label.configure(image=ctk_img, text="")
+            self._video_label._ctk_img = ctk_img   # evita GC
+        except Exception:
+            pass
+
+    # ── Timeline ──────────────────────────────────────────────────────────────
+
+    def _time_to_x(self, t: float) -> int:
+        ratio = max(0.0, min(1.0, t / self.duration_s))
+        return int(_TL_PAD + ratio * (_PDISP_W - 2 * _TL_PAD))
+
+    def _x_to_time(self, x: int) -> float:
+        ratio = (x - _TL_PAD) / (_PDISP_W - 2 * _TL_PAD)
+        return max(0.0, min(self.duration_s, ratio * self.duration_s))
+
+    def _draw_timeline(self):
+        c = self._canvas
+        c.delete("all")
+
+        x0, x1       = _TL_PAD, _PDISP_W - _TL_PAD
+        bar_top       = 26
+        bar_bot       = 44
+        handle_top    = bar_top - 22
+        handle_bot    = bar_top - 10
+
+        xs = self._time_to_x(self.trim_start)
+        xe = self._time_to_x(self.trim_end)
+        xn = self._time_to_x(self._current_time)
+
+        # Trilha de fundo
+        c.create_rectangle(x0, bar_top, x1, bar_bot, fill="#333333", outline="")
+        # Região selecionada
+        c.create_rectangle(xs, bar_top, xe, bar_bot, fill="#2a7ac0", outline="")
+
+        # Handle de início (azul)
+        c.create_rectangle(xs - 3, bar_top - 12, xs + 3, bar_bot + 6,
+                            fill="#4fc3f7", outline="")
+        c.create_rectangle(xs - 10, handle_top, xs + 10, handle_bot,
+                            fill="#4fc3f7", outline="#1a1a1a")
+        c.create_text(max(xs, x0 + 24), bar_bot + 14,
+                      text=_fmt_time(self.trim_start),
+                      fill="#4fc3f7", font=("Courier", 8), anchor="n")
+
+        # Handle de fim (laranja)
+        c.create_rectangle(xe - 3, bar_top - 12, xe + 3, bar_bot + 6,
+                            fill="#f07b3f", outline="")
+        c.create_rectangle(xe - 10, handle_top, xe + 10, handle_bot,
+                            fill="#f07b3f", outline="#1a1a1a")
+        c.create_text(min(xe, x1 - 24), bar_bot + 14,
+                      text=_fmt_time(self.trim_end),
+                      fill="#f07b3f", font=("Courier", 8), anchor="n")
+
+        # Agulha (branca) — posição atual
+        c.create_line(xn, 0, xn, bar_bot + 6, fill="#ffffff", width=2)
+        c.create_oval(xn - 5, 1, xn + 5, 11, fill="#ffffff", outline="")
+
+    def _update_time_label(self):
+        self._lbl_time.configure(
+            text=f"{_fmt_time(self._current_time)} / {_fmt_time(self.duration_s)}"
+        )
+
+    # ── Eventos de mouse na timeline ──────────────────────────────────────────
+
+    def _on_press(self, event):
+        xs = self._time_to_x(self.trim_start)
+        xe = self._time_to_x(self.trim_end)
+        x  = event.x
+
+        if abs(x - xs) <= 12:
+            self._drag_what = "start"
+            if self._playing:
+                self._toggle_play()
+        elif abs(x - xe) <= 12:
+            self._drag_what = "end"
+            if self._playing:
+                self._toggle_play()
+        else:
+            self._drag_what = "seek"
+            self._seek(self._x_to_time(x))
+
+    def _on_drag(self, event):
+        x = max(_TL_PAD, min(_PDISP_W - _TL_PAD, event.x))
+        t = self._x_to_time(x)
+        if self._drag_what == "start":
+            self.trim_start = max(0.0, min(t, self.trim_end - 0.1))
+            self._seek(self.trim_start)
+        elif self._drag_what == "end":
+            self.trim_end = min(self.duration_s, max(t, self.trim_start + 0.1))
+            self._seek(self.trim_end)
+        elif self._drag_what == "seek":
+            self._seek(t)
+
+    def _on_release(self, _event):
+        self._drag_what = None
+
+    # ── Snap: ajusta marcador à posição atual ─────────────────────────────────
+
+    def _snap_start(self):
+        self.trim_start = max(0.0, min(self._current_time, self.trim_end - 0.1))
+        self._draw_timeline()
+
+    def _snap_end(self):
+        self.trim_end = min(self.duration_s, max(self._current_time, self.trim_start + 0.1))
+        self._draw_timeline()
+
+    # ── Fechar ────────────────────────────────────────────────────────────────
+
+    def _on_confirm(self):
+        self.result = (self.trim_start, self.trim_end)
+        self._cleanup()
+
+    def _on_cancel(self):
+        self._cleanup()
+
+    def _cleanup(self):
+        self._playing = False
+        if self._after_id:
+            try:
+                self._win.after_cancel(self._after_id)
+            except Exception:
+                pass
+        if hasattr(self, "cap") and self.cap:
+            self.cap.release()
+        try:
+            self._win.destroy()
+        except Exception:
+            pass
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # UI — MÁQUINA DE ESTADOS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -616,6 +990,9 @@ class VideoCompressorApp(ctk.CTk):
         self.probe:      Optional[dict] = None
         self.target_bytes: Optional[int] = None
         self.accel_label: str = ""
+
+        self._trim_start: Optional[float] = None  # definido pelo VideoTrimDialog
+        self._trim_end:   Optional[float] = None
 
         self.cancel_evt  = threading.Event()
         self.comp_thread: Optional[threading.Thread] = None
@@ -801,17 +1178,28 @@ class VideoCompressorApp(ctk.CTk):
         )
         self._chk_h265.grid(row=5, column=0, sticky="w", padx=12, pady=(8, 0))
 
-        # ── Recorte (#16) ─────────────────────────────────────────────────────
-        trim_frame = ctk.CTkFrame(f, fg_color="transparent")
-        trim_frame.grid(row=6, column=0, sticky="w", padx=8, pady=(6, 0))
+        # ── Recorte interativo ────────────────────────────────────────────────
+        trim_row = ctk.CTkFrame(f, fg_color="transparent")
+        trim_row.grid(row=6, column=0, sticky="ew", padx=8, pady=(6, 0))
+        trim_row.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(trim_frame, text="Recortar (opcional):", font=self._f_small).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(trim_frame, text="De").pack(side="left", padx=(0, 4))
-        self._entry_trim_start = ctk.CTkEntry(trim_frame, placeholder_text="0:00", width=70)
-        self._entry_trim_start.pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(trim_frame, text="Até").pack(side="left", padx=(0, 4))
-        self._entry_trim_end = ctk.CTkEntry(trim_frame, placeholder_text="mm:ss", width=70)
-        self._entry_trim_end.pack(side="left")
+        ctk.CTkButton(
+            trim_row, text="✂  Recortar vídeo...", height=34, width=160,
+            fg_color="transparent", border_width=1, font=self._f_small,
+            command=self._open_trim_dialog,
+        ).grid(row=0, column=0, padx=(0, 10))
+
+        self._lbl_trim = ctk.CTkLabel(
+            trim_row, text="Sem recorte",
+            font=self._f_small, text_color="gray", anchor="w",
+        )
+        self._lbl_trim.grid(row=0, column=1, sticky="w")
+
+        ctk.CTkButton(
+            trim_row, text="✕", width=28, height=28,
+            fg_color="transparent", font=self._f_small,
+            command=self._clear_trim,
+        ).grid(row=0, column=2)
 
         # ── Botões de ação ────────────────────────────────────────────────────
         actions = ctk.CTkFrame(f, fg_color="transparent")
@@ -1128,8 +1516,9 @@ class VideoCompressorApp(ctk.CTk):
         # Reseta presets e campos
         self._entry_custom.configure(state="disabled")
         self._entry_custom.delete(0, "end")
-        self._entry_trim_start.delete(0, "end")
-        self._entry_trim_end.delete(0, "end")
+        self._trim_start = None
+        self._trim_end   = None
+        self._lbl_trim.configure(text="Sem recorte")
         self._chk_h265_var.set(False)
         for btn in self._preset_btns:
             btn.configure(fg_color="transparent")
@@ -1175,7 +1564,6 @@ class VideoCompressorApp(ctk.CTk):
     def _back(self):
         self._del_thumb()
         if len(self._queue) > 1:
-            # Volta para a fila no DROP
             self.input_path = None
             self.probe = None
             self._go(_DROP)
@@ -1185,6 +1573,36 @@ class VideoCompressorApp(ctk.CTk):
             self.input_path = None
             self.probe = None
             self._go(_DROP)
+
+    def _open_trim_dialog(self):
+        if not self.input_path or not self.probe:
+            return
+        dialog = VideoTrimDialog(
+            parent        = self,
+            ffmpeg_path   = self.ffmpeg,
+            input_path    = str(self.input_path),
+            duration_s    = self.probe["duration_s"],
+            initial_start = self._trim_start or 0.0,
+            initial_end   = self._trim_end   or self.probe["duration_s"],
+        )
+        if dialog.result is not None:
+            start, end = dialog.result
+            # Descarta marcadores redundantes (início ≈ 0 ou fim ≈ duração total)
+            self._trim_start = start if start > 0.5 else None
+            self._trim_end   = end   if end < self.probe["duration_s"] - 0.5 else None
+            if self._trim_start is None and self._trim_end is None:
+                self._lbl_trim.configure(text="Sem recorte", text_color="gray")
+            else:
+                s = _fmt_time(self._trim_start or 0)
+                e = _fmt_time(self._trim_end   or self.probe["duration_s"])
+                self._lbl_trim.configure(
+                    text=f"De {s} até {e}", text_color=("gray10", "gray90"),
+                )
+
+    def _clear_trim(self):
+        self._trim_start = None
+        self._trim_end   = None
+        self._lbl_trim.configure(text="Sem recorte", text_color="gray")
 
     def _start_compress(self):
         # Resolve tamanho alvo
@@ -1202,29 +1620,9 @@ class VideoCompressorApp(ctk.CTk):
                 messagebox.showerror("Valor inválido", "Informe um tamanho válido em MB (ex: 8.5).")
                 return
 
-        # Valida recorte (#16)
-        trim_start: Optional[float] = None
-        trim_end:   Optional[float] = None
-        ts_raw = self._entry_trim_start.get().strip()
-        te_raw = self._entry_trim_end.get().strip()
-        if ts_raw:
-            trim_start = _parse_time(ts_raw)
-            if trim_start is None:
-                messagebox.showerror("Recorte inválido", "Início inválido. Use o formato mm:ss (ex: 0:30).")
-                return
-        if te_raw:
-            trim_end = _parse_time(te_raw)
-            if trim_end is None:
-                messagebox.showerror("Recorte inválido", "Fim inválido. Use o formato mm:ss (ex: 1:20).")
-                return
-        if trim_start is not None and trim_end is not None:
-            if trim_end <= trim_start:
-                messagebox.showerror("Recorte inválido", "'Até' deve ser maior que 'De'.")
-                return
-            if self.probe and trim_end > self.probe["duration_s"]:
-                messagebox.showerror("Recorte inválido",
-                    f"'Até' excede a duração do vídeo ({int(self.probe['duration_s'])}s).")
-                return
+        # Recorte definido pelo VideoTrimDialog (já validado)
+        trim_start = self._trim_start
+        trim_end   = self._trim_end
 
         # Valida espaço em disco (#15)
         tmp_dir   = Path(tempfile.gettempdir())
@@ -1419,6 +1817,8 @@ class VideoCompressorApp(ctk.CTk):
         self.probe        = None
         self.target_bytes = None
         self._saved_path  = None
+        self._trim_start  = None
+        self._trim_end    = None
         self._entry_save_path.delete(0, "end")
         self._lbl_save_status.configure(text="")
         self._btn_save.configure(text="Salvar", state="normal")
