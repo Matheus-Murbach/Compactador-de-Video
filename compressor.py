@@ -238,20 +238,22 @@ class FFmpegHandler:
 
         accel = self._detect_accel(ffmpeg_path)
 
-        base = [ffmpeg_path, "-y"]
+        # -loglevel warning suprime diagnosticos do FFmpeg no stderr sem afetar -progress pipe:2
+        base = [ffmpeg_path, "-y", "-loglevel", "warning"]
         audio = ["-c:a", "aac", "-b:a", f"{AUDIO_RESERVE_KBPS}k"] if has_audio else ["-an"]
         tail = audio + ["-movflags", "+faststart", "-progress", "pipe:2", str(output_path)]
 
         if accel == "nvenc":
+            # Decode no CPU, encode na GPU — funciona com qualquer codec de entrada
             cmd = base + [
-                "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
                 "-i", str(input_path),
                 "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll",
                 "-b:v", f"{video_kbps}k", "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
             ] + tail
         elif accel == "vaapi":
+            # Decode no CPU, filter faz upload para VAAPI (nao usar hwaccel_output_format aqui)
             cmd = base + [
-                "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
+                "-hwaccel", "vaapi",
                 "-hwaccel_device", "/dev/dri/renderD128",
                 "-i", str(input_path),
                 "-c:v", "h264_vaapi",
@@ -336,7 +338,11 @@ def _parse_progress_block(lines: list[str], duration_s: float) -> Optional[tuple
     if not out_us or not out_us.lstrip("-").isdigit():
         return None
 
-    elapsed = max(0, int(out_us)) / 1_000_000
+    out_us_int = int(out_us)
+    if out_us_int < 0:  # FFmpeg emite -1 antes do primeiro frame estar pronto
+        return None
+
+    elapsed = out_us_int / 1_000_000
     pct = min(100.0, elapsed / max(duration_s, 0.001) * 100)
 
     fps = data.get("fps", "?")
