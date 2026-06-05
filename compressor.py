@@ -491,7 +491,7 @@ def _parse_time(s: str) -> Optional[float]:
     if not m:
         return None
     parts = [int(x) for x in m.groups(default="0")]
-    h, mi, sec = (parts[2], parts[0], parts[1]) if m.group(3) else (0, parts[0], parts[1])
+    h, mi, sec = (parts[0], parts[1], parts[2]) if m.group(3) else (0, parts[0], parts[1])
     return h * 3600 + mi * 60 + sec
 
 
@@ -590,7 +590,7 @@ class VideoCompressorApp(ctk.CTk):
         self._lbl_queue_count.pack(pady=(12, 0))
 
         self._queue_listbox = ctk.CTkScrollableFrame(inner, width=420, height=80)
-        self._queue_listbox.pack(pady=(4, 0))
+        # não chama .pack() aqui — _update_queue_display controla a visibilidade
         self._queue_listbox.grid_columnconfigure(0, weight=1)
         self._queue_listbox_labels: list[ctk.CTkLabel] = []
 
@@ -873,14 +873,14 @@ class VideoCompressorApp(ctk.CTk):
         # Mostra contagem e lista
         if n == 0:
             self._lbl_queue_count.configure(text="")
-            self._queue_listbox.grid_remove()
+            self._queue_listbox.pack_forget()
             for lbl in self._queue_listbox_labels:
                 lbl.destroy()
             self._queue_listbox_labels.clear()
             self._btn_go_config.configure(state="disabled")
         else:
             self._lbl_queue_count.configure(text=f"{n} arquivo(s) na fila")
-            self._queue_listbox.grid()
+            self._queue_listbox.pack(pady=(4, 0))
             # Rebuild lista
             for lbl in self._queue_listbox_labels:
                 lbl.destroy()
@@ -919,7 +919,6 @@ class VideoCompressorApp(ctk.CTk):
             return
 
         # Feedback visual durante o probe (#17)
-        self._browse_btn_text_backup = "Abrir Vídeo(s)"
         self.configure(cursor="watch")
         self.update()
 
@@ -947,7 +946,9 @@ class VideoCompressorApp(ctk.CTk):
         """Extrai thumbnail em background e atualiza a UI quando pronto. (#1)"""
         if not self.input_path:
             return
-        tmp = Path(tempfile.mktemp(suffix=".png", prefix="vcomp_thumb_"))
+        fd, tmp_str = tempfile.mkstemp(suffix=".png", prefix="vcomp_thumb_")
+        os.close(fd)
+        tmp = Path(tmp_str)
         ok = self.handler.get_thumbnail(self.ffmpeg, str(self.input_path), str(tmp))
         if ok:
             self._thumb_path = tmp
