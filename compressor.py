@@ -484,6 +484,98 @@ def _open_folder(path: Path) -> None:
         pass
 
 
+# ── Diálogos de arquivo nativos (Linux: zenity → kdialog → tkinter fallback) ──
+
+def _ask_open_files() -> list[str]:
+    """Seletor de arquivos — tenta dialogo nativo no Linux, fallback tkinter."""
+    if platform.system() == "Linux":
+        result = _linux_ask_open()
+        if result is not None:
+            return result
+    exts = " ".join(f"*{e}" for e in sorted(SUPPORTED_EXT))
+    return list(filedialog.askopenfilenames(
+        title="Selecionar vídeo(s)",
+        filetypes=[("Vídeos", exts), ("Todos os arquivos", "*.*")],
+    ))
+
+
+def _linux_ask_open() -> Optional[list[str]]:
+    """Usa zenity ou kdialog. Retorna None se nenhum estiver disponível."""
+    exts = " ".join(f"*{e}" for e in sorted(SUPPORTED_EXT))
+    # zenity (GNOME / GTK)
+    try:
+        r = subprocess.run(
+            ["zenity", "--file-selection", "--multiple",
+             f"--file-filter=Vídeos | {exts}",
+             "--separator=\n", "--title=Selecionar vídeo(s)"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode == 0:
+            return [p for p in r.stdout.strip().split("\n") if p]
+        return []   # usuário cancelou
+    except FileNotFoundError:
+        pass
+    # kdialog (KDE)
+    try:
+        r = subprocess.run(
+            ["kdialog", "--getopenfilename", str(Path.home()), exts,
+             "--title", "Selecionar vídeo(s)"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode == 0:
+            return [p for p in r.stdout.strip().split("\n") if p]
+        return []
+    except FileNotFoundError:
+        pass
+    return None  # nenhum nativo disponível — tkinter assume
+
+
+def _ask_save_file(initial: str) -> Optional[str]:
+    """Seletor de destino — tenta dialogo nativo no Linux, fallback tkinter."""
+    if platform.system() == "Linux":
+        result = _linux_ask_save(initial)
+        if result is not None:
+            return result or None
+    p = Path(initial)
+    dest = filedialog.asksaveasfilename(
+        title="Salvar vídeo comprimido",
+        defaultextension=".mp4",
+        initialfile=p.name,
+        initialdir=str(p.parent),
+        filetypes=[("Vídeo MP4", "*.mp4"), ("Todos os arquivos", "*.*")],
+    )
+    return dest or None
+
+
+def _linux_ask_save(initial: str) -> Optional[str]:
+    """Usa zenity ou kdialog para salvar. Retorna None se nenhum disponível."""
+    # zenity
+    try:
+        r = subprocess.run(
+            ["zenity", "--file-selection", "--save", "--confirm-overwrite",
+             f"--filename={initial}", "--title=Salvar vídeo comprimido"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip() or ""
+        return ""
+    except FileNotFoundError:
+        pass
+    # kdialog
+    try:
+        r = subprocess.run(
+            ["kdialog", "--getsavefilename", initial, "*.mp4",
+             "--title", "Salvar vídeo comprimido"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip() or ""
+        return ""
+    except FileNotFoundError:
+        pass
+    return None
+
+
 def _parse_time(s: str) -> Optional[float]:
     """Converte mm:ss ou hh:mm:ss em segundos. Retorna None se inválido. (#16)"""
     s = s.strip()
@@ -781,46 +873,78 @@ class VideoCompressorApp(ctk.CTk):
     # ── Frame DONE ────────────────────────────────────────────────────────────
 
     def _make_done_frame(self) -> ctk.CTkFrame:
-        f = ctk.CTkFrame(self)
-        f.grid_rowconfigure(0, weight=1)
-        f.grid_columnconfigure(0, weight=1)
+        outer = ctk.CTkFrame(self)
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
 
-        inner = ctk.CTkFrame(f, fg_color="transparent")
-        inner.grid(row=0, column=0)
+        # Conteúdo rolável — o cartão de salvar ocupa espaço extra
+        scroll = ctk.CTkScrollableFrame(outer)
+        scroll.grid(row=0, column=0, sticky="nsew")
+        scroll.grid_columnconfigure(0, weight=1)
+        f = scroll
 
+        # ── Header ───────────────────────────────────────────────────────────
         ctk.CTkLabel(
-            inner, text="✓", font=ctk.CTkFont(size=56, weight="bold"), text_color="#4caf50",
-        ).pack(pady=(0, 8))
-        ctk.CTkLabel(inner, text="Concluído!", font=self._f_bold_l).pack()
+            f, text="✓", font=ctk.CTkFont(size=56, weight="bold"), text_color="#4caf50",
+        ).grid(row=0, column=0, pady=(12, 0))
+        ctk.CTkLabel(f, text="Concluído!", font=self._f_bold_l).grid(row=1, column=0)
 
-        # Resumo de resultados (fila: lista; único: linha simples) (#8)
-        self._lbl_sizes = ctk.CTkLabel(inner, text="", font=self._f_small, text_color="gray")
-        self._lbl_sizes.pack(pady=(4, 4))
+        # Resumo de tamanhos (#8)
+        self._lbl_sizes = ctk.CTkLabel(f, text="", font=self._f_small, text_color="gray")
+        self._lbl_sizes.grid(row=2, column=0, pady=(4, 0), padx=12)
 
-        self._results_box = ctk.CTkScrollableFrame(inner, width=420, height=70)
-        self._results_box.pack(pady=(0, 16))
+        self._results_box = ctk.CTkScrollableFrame(f, width=460, height=64)
+        self._results_box.grid(row=3, column=0, pady=(4, 8), padx=12)
         self._results_box.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkButton(
-            inner, text="Salvar Como...", width=220, height=44, font=self._f_bold_l,
-            command=self._save,
-        ).pack(pady=(0, 6))
+        # ── Cartão de salvar (tudo dentro da janela) ─────────────────────────
+        card = ctk.CTkFrame(f, fg_color=("gray88", "gray18"), corner_radius=8)
+        card.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 10))
+        card.grid_columnconfigure(0, weight=1)
 
-        # Abrir pasta (#5)
+        ctk.CTkLabel(card, text="Salvar como:", font=self._f_bold,
+                     anchor="w").grid(row=0, column=0, sticky="w", padx=14, pady=(12, 4))
+
+        path_row = ctk.CTkFrame(card, fg_color="transparent")
+        path_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 6))
+        path_row.grid_columnconfigure(0, weight=1)
+
+        self._entry_save_path = ctk.CTkEntry(
+            path_row, placeholder_text="Caminho de destino...",
+        )
+        self._entry_save_path.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(
+            path_row, text="Procurar", width=84, height=30,
+            fg_color="transparent", border_width=1, font=self._f_small,
+            command=self._browse_save_path,
+        ).grid(row=0, column=1)
+
+        self._btn_save = ctk.CTkButton(
+            card, text="Salvar", width=220, height=42, font=self._f_bold_l,
+            command=self._save,
+        )
+        self._btn_save.grid(row=2, column=0, padx=14, pady=(0, 6))
+
+        self._lbl_save_status = ctk.CTkLabel(
+            card, text="", font=self._f_small, wraplength=440,
+        )
+        self._lbl_save_status.grid(row=3, column=0, padx=14, pady=(0, 12))
+
+        # ── Ações secundárias ─────────────────────────────────────────────────
         self._btn_open_folder = ctk.CTkButton(
-            inner, text="Abrir pasta", width=220, height=34,
+            f, text="Abrir pasta", width=220, height=34,
             fg_color="transparent", border_width=1,
             command=self._open_saved_folder,
         )
-        self._btn_open_folder.pack(pady=(0, 6))
+        self._btn_open_folder.grid(row=5, column=0, pady=(0, 6))
 
         ctk.CTkButton(
-            inner, text="Comprimir outro vídeo", width=220, height=34,
+            f, text="Comprimir outro vídeo", width=220, height=34,
             fg_color="transparent", border_width=1,
             command=self._reset,
-        ).pack()
+        ).grid(row=6, column=0, pady=(0, 16))
 
-        return f
+        return outer
 
     # ── State Machine ─────────────────────────────────────────────────────────
 
@@ -835,12 +959,7 @@ class VideoCompressorApp(ctk.CTk):
     # ── Handlers — DROP ───────────────────────────────────────────────────────
 
     def _browse(self):
-        exts = " ".join(f"*{e}" for e in sorted(SUPPORTED_EXT))
-        paths = filedialog.askopenfilenames(
-            title="Selecionar vídeo(s)",
-            filetypes=[("Vídeos", exts), ("Todos os arquivos", "*.*")],
-        )
-        for p in paths:
+        for p in _ask_open_files():
             self._enqueue(p)
 
     def _on_drop(self, event):
@@ -1226,6 +1345,13 @@ class VideoCompressorApp(ctk.CTk):
                     self._results_box, text=r, font=self._f_small, anchor="w",
                 ).grid(row=i, column=0, sticky="ew", padx=6, pady=1)
 
+        # Preenche o campo de salvar com o caminho sugerido
+        default_save = self.input_path.parent / f"{self.input_path.stem}_comprimido.mp4"
+        self._entry_save_path.delete(0, "end")
+        self._entry_save_path.insert(0, str(default_save))
+        self._lbl_save_status.configure(text="")
+        self._btn_save.configure(text="Salvar", state="normal")
+
         self._go(_DONE)
 
     def _on_error(self, msg: str):
@@ -1238,28 +1364,42 @@ class VideoCompressorApp(ctk.CTk):
 
     # ── Handlers — DONE ───────────────────────────────────────────────────────
 
+    def _browse_save_path(self):
+        current = self._entry_save_path.get().strip()
+        if not current and self.input_path:
+            current = str(self.input_path.parent / f"{self.input_path.stem}_comprimido.mp4")
+        result = _ask_save_file(current or str(Path.home() / "video_comprimido.mp4"))
+        if result:
+            self._entry_save_path.delete(0, "end")
+            self._entry_save_path.insert(0, result)
+
     def _save(self):
         if not self.tmp_path or not self.tmp_path.exists():
-            messagebox.showerror("Arquivo não encontrado", "O arquivo comprimido não está mais disponível.")
+            self._lbl_save_status.configure(
+                text="⚠ Arquivo temporário não encontrado.", text_color="#e57373")
             return
 
-        default = f"{self.input_path.stem}_comprimido.mp4"
-        dest = filedialog.asksaveasfilename(
-            title="Salvar vídeo comprimido",
-            defaultextension=".mp4",
-            initialfile=default,
-            filetypes=[("Vídeo MP4", "*.mp4"), ("Todos os arquivos", "*.*")],
-        )
-        if not dest:
+        dest_str = self._entry_save_path.get().strip()
+        if not dest_str:
+            self._lbl_save_status.configure(
+                text="⚠ Informe o caminho de destino.", text_color="#e57373")
             return
+
+        dest = Path(dest_str)
+        if not dest.suffix:
+            dest = dest.with_suffix(".mp4")
 
         try:
-            shutil.move(str(self.tmp_path), dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(self.tmp_path), str(dest))
             self.tmp_path = None
-            self._saved_path = Path(dest)
-            messagebox.showinfo("Salvo!", f"Vídeo salvo em:\n{dest}")
+            self._saved_path = dest
+            self._btn_save.configure(text="✓ Salvo!", state="disabled")
+            self._lbl_save_status.configure(
+                text=f"Salvo em: {dest}", text_color="#4caf50")
         except OSError as exc:
-            messagebox.showerror("Erro ao salvar", f"Não foi possível salvar:\n{exc}")
+            self._lbl_save_status.configure(
+                text=f"⚠ Erro ao salvar: {exc}", text_color="#e57373")
 
     def _open_saved_folder(self):
         """Abre a pasta do arquivo salvo no explorador. (#5)"""
@@ -1275,10 +1415,13 @@ class VideoCompressorApp(ctk.CTk):
         self._queue_idx = 0
         self._queue_results.clear()
         self._update_queue_display()
-        self.input_path  = None
-        self.probe       = None
+        self.input_path   = None
+        self.probe        = None
         self.target_bytes = None
-        self._saved_path = None
+        self._saved_path  = None
+        self._entry_save_path.delete(0, "end")
+        self._lbl_save_status.configure(text="")
+        self._btn_save.configure(text="Salvar", state="normal")
         self._go(_DROP)
 
     # ── Limpeza ───────────────────────────────────────────────────────────────
