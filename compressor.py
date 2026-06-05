@@ -1001,6 +1001,24 @@ _PROGRESS = "progress"
 _DONE     = "done"
 
 
+def _setup_window(win, w: int, h: int) -> None:
+    """Janela com decoração nativa (minimizar/mover/fechar), centralizada, sem resize.
+
+    Funciona igual em Linux e Windows: usa o gerenciador de janelas do SO,
+    sem overrideredirect. minsize == maxsize trava o tamanho de forma mais
+    confiável que apenas `resizable(False, False)` em alguns WMs do Linux.
+    """
+    win.update_idletasks()
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = max(0, (sw - w) // 2)
+    y = max(0, (sh - h) // 3)  # 1/3 do topo fica visualmente melhor que centro exato
+    win.geometry(f"{w}x{h}+{x}+{y}")
+    win.minsize(w, h)
+    win.maxsize(w, h)
+    win.resizable(False, False)
+
+
 class VideoCompressorApp(ctk.CTk):
 
     def __init__(self, handler: FFmpegHandler, ffmpeg: str, ffprobe: str):
@@ -1026,9 +1044,11 @@ class VideoCompressorApp(ctk.CTk):
         self._saved_path: Optional[Path] = None  # para "Abrir pasta" (#5)
         self._thumb_path: Optional[Path] = None  # arquivo PNG temporário (#1)
 
+        # Preserva escolhas do usuário entre navegações (DROP ↔ CONFIG e fila)
+        self._last_config: Optional[dict] = None
+
         self.title("Compactador de Vídeo")
-        self.geometry(f"{APP_W}x{APP_H}")
-        self.resizable(False, False)
+        _setup_window(self, APP_W, APP_H)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
@@ -1463,9 +1483,12 @@ class VideoCompressorApp(ctk.CTk):
         self._lbl_warn.configure(text="")
         self._thumb_label.configure(image=None, text="")
 
-        # Reseta presets e campos
-        self._entry_custom.configure(state="disabled")
+        # Limpa estado dos campos (será restaurado abaixo se houver config salva)
+        for btn in self._preset_btns:
+            btn.configure(fg_color="transparent")
+        self._entry_custom.configure(state="normal")
         self._entry_custom.delete(0, "end")
+        self._entry_custom.configure(state="disabled")
         self._trim_start = None
         self._trim_end   = None
         self._lbl_trim.configure(text="Sem recorte")
@@ -1473,8 +1496,28 @@ class VideoCompressorApp(ctk.CTk):
         self._seg_quality.set("⚡ Rápido")
         self._max_height = None
         self._quality    = "fast"
-        for btn in self._preset_btns:
-            btn.configure(fg_color="transparent")
+        self.target_bytes = None
+
+        # Restaura escolhas anteriores se o usuário já configurou nesta sessão
+        cfg = self._last_config
+        if cfg:
+            if cfg.get("trim_start"):
+                self._entry_trim_start.insert(0, cfg["trim_start"])
+            if cfg.get("trim_end"):
+                self._entry_trim_end.insert(0, cfg["trim_end"])
+
+            if cfg.get("preset_label"):
+                for label, mb in PRESETS:
+                    if label == cfg["preset_label"]:
+                        self._pick_preset(label, mb)
+                        # "Personalizado..." aceita texto digitado
+                        if mb is None and cfg.get("custom_mb"):
+                            self._entry_custom.insert(0, cfg["custom_mb"])
+                        break
+
+            # H.265 vem por último — _pick_preset pode ter sugerido automaticamente,
+            # mas a escolha explícita do usuário tem prioridade
+            self._chk_h265_var.set(cfg.get("h265", False))
 
     def _pick_preset(self, label: str, mb: Optional[int]):
         for btn in self._preset_btns:
@@ -1513,7 +1556,23 @@ class VideoCompressorApp(ctk.CTk):
 
             self._lbl_warn.configure(text="  ".join(warn_parts))
 
+    def _save_current_config(self):
+        """Captura o estado atual da tela CONFIG para restaurar depois."""
+        selected_preset: Optional[str] = None
+        for btn in self._preset_btns:
+            if btn.cget("fg_color") != "transparent":
+                selected_preset = btn.cget("text")
+                break
+        self._last_config = {
+            "preset_label": selected_preset,
+            "custom_mb":    self._entry_custom.get(),
+            "trim_start":   self._entry_trim_start.get(),
+            "trim_end":     self._entry_trim_end.get(),
+            "h265":         self._chk_h265_var.get(),
+        }
+
     def _back(self):
+        self._save_current_config()
         self._del_thumb()
         self.input_path = None
         self.probe = None
@@ -1602,7 +1661,7 @@ class VideoCompressorApp(ctk.CTk):
 
         self._trim_start = trim_start
         self._trim_end   = trim_end
-        self._use_h265   = False  # ativado automaticamente em build_command via H265_KBPS_THRESHOLD
+        self._use_h265   = self._chk_h265_var.get()
 
         self.cancel_evt.clear()
         self._pbar.set(0)
@@ -1735,10 +1794,6 @@ class VideoCompressorApp(ctk.CTk):
         self.probe        = None
         self.target_bytes = None
         self._saved_path  = None
-        self._trim_start  = None
-        self._trim_end    = None
-        self._max_height  = None
-        self._quality     = "fast"
         self._entry_save_path.delete(0, "end")
         self._lbl_save_status.configure(text="")
         self._btn_save.configure(text="Salvar", state="normal")
@@ -1783,8 +1838,7 @@ class VideoCompressorApp(ctk.CTk):
 def _show_no_ffmpeg():
     win = ctk.CTk()
     win.title("FFmpeg não encontrado")
-    win.geometry("440x260")
-    win.resizable(False, False)
+    _setup_window(win, 440, 260)
 
     f_bold_l = ctk.CTkFont(size=15, weight="bold")
     ctk.CTkLabel(win, text="FFmpeg não encontrado", font=f_bold_l).pack(pady=(28, 10))
