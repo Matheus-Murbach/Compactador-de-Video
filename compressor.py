@@ -270,10 +270,11 @@ class FFmpegHandler:
         use_h265: bool = False,
         trim_start: Optional[float] = None,
         trim_end: Optional[float] = None,
+        max_height: Optional[int] = None,
+        quality: str = "fast",
     ) -> tuple[list[str], str]:
-        """Monta o comando FFmpeg com aceleração automática. Retorna (cmd, accel_name). (#13, #16)"""
+        """Monta o comando FFmpeg com aceleração automática. Retorna (cmd, accel_name)."""
         duration_s = probe["duration_s"]
-        # Duração efetiva considera o corte para calcular bitrate (#16)
         effective_s = max(
             (trim_end or duration_s) - (trim_start or 0),
             MIN_DURATION_S,
@@ -288,13 +289,11 @@ class FFmpegHandler:
         maxrate = int(video_kbps * 1.5)
         bufsize = int(video_kbps * 3)
 
-        # Usa H.265 se explicitamente pedido ou quando o bitrate é muito baixo (#13)
         force_h265 = use_h265 or (video_kbps < H265_KBPS_THRESHOLD)
         accel = self._detect_accel(ffmpeg_path)
 
         base = [ffmpeg_path, "-y", "-loglevel", "warning"]
 
-        # Parâmetros de recorte antes do input para seek rápido (#16)
         seek_args: list[str] = []
         if trim_start and trim_start > 0:
             seek_args += ["-ss", f"{trim_start:.3f}"]
@@ -303,51 +302,57 @@ class FFmpegHandler:
         if trim_end and trim_end < duration_s:
             end_args += ["-to", f"{trim_end:.3f}"]
 
+        # Filtro de resolução — só reduz, nunca amplia
+        scale_vf = (f"scale=-2:min(ih\\,{max_height})" if max_height else "")
+
         audio = ["-c:a", "aac", "-b:a", f"{AUDIO_RESERVE_KBPS}k"] if has_audio else ["-an"]
         tail  = end_args + audio + ["-movflags", "+faststart",
                                     "-progress", "pipe:2", str(output_path)]
 
+        cpu_preset   = "medium" if quality == "good" else "ultrafast"
+        nvenc_preset = "p4"     if quality == "good" else "p1"
+
         if force_h265:
-            # H.265 sempre via CPU (libx265) — GPU H.265 fica como melhoria futura
             accel_label = "H.265 CPU"
-            cmd = base + seek_args + [
-                "-i", str(input_path),
-                "-c:v", "libx265", "-preset", "ultrafast", "-tag:v", "hvc1",
+            vf = (["-vf", scale_vf] if scale_vf else [])
+            cmd = base + seek_args + ["-i", str(input_path)] + vf + [
+                "-c:v", "libx265", "-preset", cpu_preset, "-tag:v", "hvc1",
                 "-b:v", f"{video_kbps}k", "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
             ] + tail
 
         elif accel == "nvenc":
             accel_label = "GPU NVENC"
-            cmd = base + seek_args + [
-                "-i", str(input_path),
-                "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll",
+            vf = (["-vf", scale_vf] if scale_vf else [])
+            cmd = base + seek_args + ["-i", str(input_path)] + vf + [
+                "-c:v", "h264_nvenc", "-preset", nvenc_preset,
                 "-b:v", f"{video_kbps}k", "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
             ] + tail
 
         elif accel == "vaapi":
             accel_label = "GPU VAAPI"
+            vaapi_vf = (f"{scale_vf}," if scale_vf else "") + "format=nv12,hwupload"
             cmd = base + seek_args + [
                 "-hwaccel", "vaapi",
                 "-hwaccel_device", "/dev/dri/renderD128",
                 "-i", str(input_path),
                 "-c:v", "h264_vaapi",
                 "-b:v", f"{video_kbps}k", "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
-                "-vf", "format=nv12,hwupload",
+                "-vf", vaapi_vf,
             ] + tail
 
         elif accel == "videotoolbox":
             accel_label = "GPU VideoToolbox"
-            cmd = base + seek_args + [
-                "-i", str(input_path),
+            vf = (["-vf", scale_vf] if scale_vf else [])
+            cmd = base + seek_args + ["-i", str(input_path)] + vf + [
                 "-c:v", "h264_videotoolbox",
                 "-b:v", f"{video_kbps}k", "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
             ] + tail
 
-        else:  # cpu — libx264 ultrafast para máxima velocidade
+        else:
             accel_label = "CPU libx264"
-            cmd = base + seek_args + [
-                "-i", str(input_path),
-                "-c:v", "libx264", "-preset", "ultrafast",
+            vf = (["-vf", scale_vf] if scale_vf else [])
+            cmd = base + seek_args + ["-i", str(input_path)] + vf + [
+                "-c:v", "libx264", "-preset", cpu_preset,
                 "-b:v", f"{video_kbps}k", "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
             ] + tail
 
@@ -365,54 +370,80 @@ class FFmpegHandler:
         use_h265: bool = False,
         trim_start: Optional[float] = None,
         trim_end: Optional[float] = None,
+        max_height: Optional[int] = None,
+        quality: str = "fast",
     ) -> str:
-        """Executa a compressão. Retorna accel_label. Levanta CompressionError se falhar."""
-        cmd, accel_label = self.build_command(
-            ffmpeg_path, input_path, output_path, target_bytes, probe,
-            use_h265=use_h265, trim_start=trim_start, trim_end=trim_end,
-        )
-        proc = subprocess.Popen(
-            cmd, stderr=subprocess.PIPE, text=True,
-            encoding="utf-8", errors="replace",
-        )
-
-        recent_lines: list[str] = []
-        block: list[str] = []
-
-        # Duração efetiva para calcular % considerando o corte (#16)
+        """
+        Executa a compressão. Se o output ultrapassar target_bytes,
+        refaz automaticamente com bitrate mais conservador (segunda passagem).
+        Retorna accel_label. Levanta CompressionError se falhar.
+        """
         eff_duration = max(
             (trim_end or probe["duration_s"]) - (trim_start or 0),
             MIN_DURATION_S,
         )
 
-        try:
-            for raw_line in proc.stderr:
-                if cancel.is_set():
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
-                    return accel_label
+        def _run_encode(tb: int, phase: str) -> tuple[str, list[str]]:
+            """Codifica para target_bytes=tb. Retorna (accel_label, recent_lines)."""
+            cmd, label = self.build_command(
+                ffmpeg_path, input_path, output_path, tb, probe,
+                use_h265=use_h265, trim_start=trim_start, trim_end=trim_end,
+                max_height=max_height, quality=quality,
+            )
+            proc = subprocess.Popen(
+                cmd, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", errors="replace",
+            )
+            recent: list[str] = []
+            block:  list[str] = []
+            try:
+                for raw in proc.stderr:
+                    if cancel.is_set():
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait()
+                        return label, recent
+                    line = raw.strip()
+                    recent.append(line)
+                    if len(recent) > 40:
+                        recent.pop(0)
+                    block.append(line)
+                    if line.startswith("progress="):
+                        parsed = _parse_progress_block(block, eff_duration)
+                        if parsed:
+                            pct, stats = parsed
+                            on_progress(pct, f"{phase}{stats}" if phase else stats)
+                        block.clear()
+            finally:
+                if proc.returncode is None:
+                    proc.wait()
+            return label, recent, proc  # type: ignore[return-value]
 
-                line = raw_line.strip()
-                recent_lines.append(line)
-                if len(recent_lines) > 40:
-                    recent_lines.pop(0)
+        # ── Primeira passagem (95 % safety margin) ────────────────────────────
+        accel_label, lines, proc = _run_encode(target_bytes, "")
+        if cancel.is_set():
+            return accel_label
+        if proc.returncode != 0:
+            raise CompressionError("\n".join(lines[-15:]))
 
-                block.append(line)
-                if line.startswith("progress="):
-                    parsed = _parse_progress_block(block, eff_duration)
-                    if parsed:
-                        on_progress(*parsed)
-                    block.clear()
-        finally:
-            if proc.returncode is None:
-                proc.wait()
+        # ── Verificação de tamanho ────────────────────────────────────────────
+        actual = Path(output_path).stat().st_size
+        if actual > target_bytes:
+            # Segunda passagem: mira em 88% do limite garantido
+            # Usa relação actual/target para compensar a imprecisão do encoder
+            second_target = int(min(
+                target_bytes * 0.88,
+                target_bytes * (target_bytes / actual) * 0.90,
+            ))
+            second_target = max(second_target, MIN_VIDEO_KBPS * 1000)
 
-        if proc.returncode != 0 and not cancel.is_set():
-            raise CompressionError("\n".join(recent_lines[-15:]))
+            on_progress(0.0, "Ajustando (2ª passagem)...")
+            accel_label, lines2, proc2 = _run_encode(second_target, "")
+            if not cancel.is_set() and proc2.returncode != 0:
+                raise CompressionError("\n".join(lines2[-15:]))
 
         return accel_label
 
@@ -980,19 +1011,14 @@ class VideoCompressorApp(ctk.CTk):
 
         self.state = _DROP
 
-        # Fila de arquivos (#8) — substitui self.input_path único
-        self._queue: list[Path]      = []
-        self._queue_idx: int         = 0
-        self._queue_results: list[str] = []
+        self.input_path:   Optional[Path] = None
+        self.probe:        Optional[dict] = None
+        self.target_bytes: Optional[int]  = None
 
-        # Arquivo atual sendo processado
-        self.input_path: Optional[Path] = None
-        self.probe:      Optional[dict] = None
-        self.target_bytes: Optional[int] = None
-        self.accel_label: str = ""
-
-        self._trim_start: Optional[float] = None  # definido pelo VideoTrimDialog
-        self._trim_end:   Optional[float] = None
+        self._trim_start:  Optional[float] = None
+        self._trim_end:    Optional[float] = None
+        self._max_height:  Optional[int]   = None   # None = original
+        self._quality:     str             = "fast" # "fast" | "good"
 
         self.cancel_evt  = threading.Event()
         self.comp_thread: Optional[threading.Thread] = None
@@ -1041,43 +1067,16 @@ class VideoCompressorApp(ctk.CTk):
         inner.grid(row=0, column=0)
 
         ctk.CTkLabel(inner, text="▶", font=self._f_icon).pack(pady=(0, 10))
-        ctk.CTkLabel(inner, text="Clique para abrir um vídeo", font=self._f_bold_l).pack()
+        ctk.CTkLabel(inner, text="Arraste um vídeo ou clique para abrir",
+                     font=self._f_bold_l).pack()
         ctk.CTkLabel(
             inner, text="MP4 · MOV · MKV · AVI · WEBM · FLV · WMV",
             font=self._f_small, text_color="gray",
         ).pack(pady=(4, 16))
-
         ctk.CTkButton(
-            inner, text="Abrir Vídeo(s)", width=200, height=44, font=self._f_bold_l,
+            inner, text="Abrir Vídeo", width=200, height=44, font=self._f_bold_l,
             command=self._browse,
         ).pack()
-
-        # Lista compacta de arquivos na fila (#8)
-        self._lbl_queue_count = ctk.CTkLabel(
-            inner, text="", font=self._f_small, text_color="gray",
-        )
-        self._lbl_queue_count.pack(pady=(12, 0))
-
-        self._queue_listbox = ctk.CTkScrollableFrame(inner, width=420, height=80)
-        # não chama .pack() aqui — _update_queue_display controla a visibilidade
-        self._queue_listbox.grid_columnconfigure(0, weight=1)
-        self._queue_listbox_labels: list[ctk.CTkLabel] = []
-
-        btn_row = ctk.CTkFrame(inner, fg_color="transparent")
-        btn_row.pack(pady=(6, 0))
-        ctk.CTkButton(
-            btn_row, text="Limpar fila", width=120, height=30,
-            fg_color="transparent", border_width=1, font=self._f_small,
-            command=self._clear_queue,
-        ).pack(side="left", padx=4)
-        self._btn_go_config = ctk.CTkButton(
-            btn_row, text="Continuar →", width=140, height=30,
-            font=self._f_small,
-            command=self._queue_to_config,
-        )
-        self._btn_go_config.pack(side="left", padx=4)
-
-        self._update_queue_display()
 
         # Drag-and-drop — silenciosamente opcional (requer tkinterdnd2)
         try:
@@ -1096,18 +1095,16 @@ class VideoCompressorApp(ctk.CTk):
         outer.grid_rowconfigure(0, weight=1)
         outer.grid_columnconfigure(0, weight=1)
 
-        # Conteúdo rolável para acomodar todos os campos (#1, #13, #16)
         scroll = ctk.CTkScrollableFrame(outer)
         scroll.grid(row=0, column=0, sticky="nsew")
         scroll.grid_columnconfigure(0, weight=1)
-        f = scroll  # alias conveniente
+        f = scroll
 
-        # ── Cabeçalho: thumbnail + info ──────────────────────────────────────
+        # ── Thumbnail + info ─────────────────────────────────────────────────
         head = ctk.CTkFrame(f, fg_color="transparent")
         head.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
         head.grid_columnconfigure(1, weight=1)
 
-        # Thumbnail (#1)
         self._thumb_label = ctk.CTkLabel(
             head, text="", width=THUMB_W, height=THUMB_H,
             fg_color=("gray80", "gray20"), corner_radius=6,
@@ -1125,38 +1122,33 @@ class VideoCompressorApp(ctk.CTk):
         )
         self._lbl_info.grid(row=1, column=1, sticky="ew")
 
-        # Estimativa de tempo (#2)
         self._lbl_estimate = ctk.CTkLabel(
             head, text="", font=self._f_small, text_color="gray",
             anchor="w", justify="left",
         )
         self._lbl_estimate.grid(row=2, column=1, sticky="ew")
 
-        # Aviso / tamanho estimado (#7)
-        self._lbl_warn = ctk.CTkLabel(
-            f, text="", font=self._f_small, text_color="#f0a500",
-        )
+        self._lbl_warn = ctk.CTkLabel(f, text="", font=self._f_small, text_color="#f0a500")
         self._lbl_warn.grid(row=1, column=0, pady=(0, 4), padx=8)
 
-        # ── Presets ───────────────────────────────────────────────────────────
+        # ── Bloco 1: Tamanho máximo ───────────────────────────────────────────
         ctk.CTkLabel(f, text="Tamanho máximo:", font=self._f_bold).grid(
             row=2, column=0, sticky="w", padx=12, pady=(4, 4),
         )
 
-        grid = ctk.CTkFrame(f, fg_color="transparent")
-        grid.grid(row=3, column=0, padx=8, sticky="ew")
-        grid.grid_columnconfigure((0, 1), weight=1)
+        pgrid = ctk.CTkFrame(f, fg_color="transparent")
+        pgrid.grid(row=3, column=0, padx=8, sticky="ew")
+        pgrid.grid_columnconfigure((0, 1), weight=1)
 
         self._preset_btns: list[ctk.CTkButton] = []
         for i, (label, mb) in enumerate(PRESETS):
-            row, col = divmod(i, 2)
+            row_i, col = divmod(i, 2)
             btn = ctk.CTkButton(
-                grid, text=label, height=34,
-                fg_color="transparent", border_width=1,
-                font=self._f_small,
+                pgrid, text=label, height=34,
+                fg_color="transparent", border_width=1, font=self._f_small,
                 command=lambda lbl=label, size=mb: self._pick_preset(lbl, size),
             )
-            btn.grid(row=row, column=col, padx=3, pady=2, sticky="ew")
+            btn.grid(row=row_i, column=col, padx=3, pady=2, sticky="ew")
             self._preset_btns.append(btn)
 
         custom_row = ctk.CTkFrame(f, fg_color="transparent")
@@ -1168,19 +1160,38 @@ class VideoCompressorApp(ctk.CTk):
         self._entry_custom.pack(side="left", padx=(0, 6))
         ctk.CTkLabel(custom_row, text="MB").pack(side="left")
 
-        # ── H.265 (#13) ───────────────────────────────────────────────────────
-        self._chk_h265_var = ctk.BooleanVar(value=False)
-        self._chk_h265 = ctk.CTkCheckBox(
-            f,
-            text="Usar H.265 (melhor qualidade, mais lento — recomendado para compressões >90%)",
-            variable=self._chk_h265_var,
+        # ── Bloco 2: Resolução + Qualidade ────────────────────────────────────
+        opts_card = ctk.CTkFrame(f, fg_color=("gray88", "gray18"), corner_radius=8)
+        opts_card.grid(row=5, column=0, sticky="ew", padx=8, pady=(10, 0))
+        opts_card.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(opts_card, text="Resolução:", font=self._f_small, anchor="w").grid(
+            row=0, column=0, sticky="w", padx=12, pady=(10, 4),
+        )
+        self._seg_res = ctk.CTkSegmentedButton(
+            opts_card,
+            values=["Original", "720p", "480p", "360p"],
+            command=self._on_res_change,
             font=self._f_small,
         )
-        self._chk_h265.grid(row=5, column=0, sticky="w", padx=12, pady=(8, 0))
+        self._seg_res.set("Original")
+        self._seg_res.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=(10, 4))
 
-        # ── Recorte interativo ────────────────────────────────────────────────
+        ctk.CTkLabel(opts_card, text="Qualidade:", font=self._f_small, anchor="w").grid(
+            row=1, column=0, sticky="w", padx=12, pady=(0, 10),
+        )
+        self._seg_quality = ctk.CTkSegmentedButton(
+            opts_card,
+            values=["⚡ Rápido", "★ Melhor qualidade"],
+            command=self._on_quality_change,
+            font=self._f_small,
+        )
+        self._seg_quality.set("⚡ Rápido")
+        self._seg_quality.grid(row=1, column=1, sticky="w", padx=(0, 12), pady=(0, 10))
+
+        # ── Bloco 3: Recorte ──────────────────────────────────────────────────
         trim_row = ctk.CTkFrame(f, fg_color="transparent")
-        trim_row.grid(row=6, column=0, sticky="ew", padx=8, pady=(6, 0))
+        trim_row.grid(row=6, column=0, sticky="ew", padx=8, pady=(8, 0))
         trim_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkButton(
@@ -1201,7 +1212,7 @@ class VideoCompressorApp(ctk.CTk):
             command=self._clear_trim,
         ).grid(row=0, column=2)
 
-        # ── Botões de ação ────────────────────────────────────────────────────
+        # ── Ações ─────────────────────────────────────────────────────────────
         actions = ctk.CTkFrame(f, fg_color="transparent")
         actions.grid(row=7, column=0, padx=8, pady=(10, 8), sticky="ew")
         ctk.CTkButton(
@@ -1347,73 +1358,18 @@ class VideoCompressorApp(ctk.CTk):
     # ── Handlers — DROP ───────────────────────────────────────────────────────
 
     def _browse(self):
-        for p in _ask_open_files():
-            self._enqueue(p)
+        paths = _ask_open_files()
+        if paths:
+            self._load(paths[0])
 
     def _on_drop(self, event):
-        # tkinterdnd2 entrega múltiplos arquivos separados por espaço ou em {}
         raw = event.data.strip()
         paths = re.findall(r"\{([^}]+)\}|(\S+)", raw)
         for match in paths:
             p = match[0] or match[1]
             if p:
-                self._enqueue(p)
-
-    def _enqueue(self, path: str):
-        p = Path(path).resolve()
-        if p.suffix.lower() not in SUPPORTED_EXT:
-            messagebox.showerror(
-                "Formato inválido",
-                f"'{p.name}' não é um vídeo suportado.\n\nFormatos: {', '.join(sorted(SUPPORTED_EXT))}",
-            )
-            return
-        if p not in self._queue:
-            self._queue.append(p)
-        self._update_queue_display()
-
-    def _clear_queue(self):
-        self._queue.clear()
-        self._update_queue_display()
-
-    def _update_queue_display(self):
-        n = len(self._queue)
-        # Mostra contagem e lista
-        if n == 0:
-            self._lbl_queue_count.configure(text="")
-            self._queue_listbox.pack_forget()
-            for lbl in self._queue_listbox_labels:
-                lbl.destroy()
-            self._queue_listbox_labels.clear()
-            self._btn_go_config.configure(state="disabled")
-        else:
-            self._lbl_queue_count.configure(text=f"{n} arquivo(s) na fila")
-            self._queue_listbox.pack(pady=(4, 0))
-            # Rebuild lista
-            for lbl in self._queue_listbox_labels:
-                lbl.destroy()
-            self._queue_listbox_labels.clear()
-            for i, p in enumerate(self._queue):
-                lbl = ctk.CTkLabel(
-                    self._queue_listbox, text=f"{i+1}. {p.name}",
-                    font=self._f_small, anchor="w",
-                )
-                lbl.grid(row=i, column=0, sticky="ew", padx=6, pady=1)
-                self._queue_listbox_labels.append(lbl)
-            self._btn_go_config.configure(state="normal")
-
-    def _queue_to_config(self):
-        """Carrega o primeiro arquivo da fila e vai para CONFIG."""
-        if not self._queue:
-            return
-        self._queue_idx = 0
-        self._load_from_queue()
-
-    def _load_from_queue(self):
-        """Carrega self._queue[self._queue_idx] com probe + thumbnail."""
-        if self._queue_idx >= len(self._queue):
-            return
-        p = self._queue[self._queue_idx]
-        self._load(str(p))
+                self._load(p)
+                break  # um arquivo por vez
 
     def _load(self, path: str):
         """Analisa o arquivo, extrai thumbnail e vai para CONFIG. (#10, #17)"""
@@ -1489,19 +1445,14 @@ class VideoCompressorApp(ctk.CTk):
 
     def _fill_config(self):
         p = self.probe
-        # Informação principal
-        queue_info = (
-            f"  [{self._queue_idx + 1}/{len(self._queue)}]"
-            if len(self._queue) > 1 else ""
-        )
-        self._lbl_name.configure(text=self.input_path.name + queue_info)
+        self._lbl_name.configure(text=self.input_path.name)
         dur = int(p["duration_s"])
         self._lbl_info.configure(
             text=f"{p['width']}×{p['height']}  •  {dur // 60}:{dur % 60:02d}"
                  f"  •  {p['size_bytes'] / 1048576:.1f} MB  •  {p['codec']}"
         )
 
-        # Estimativa de tempo (#2)
+        # Estimativa de tempo
         accel = FFmpegHandler._accel_cache or "cpu"
         speed_factor = _SPEED_FACTOR.get(accel, 4)
         est_s = max(1, int(p["duration_s"] / speed_factor))
@@ -1510,7 +1461,6 @@ class VideoCompressorApp(ctk.CTk):
         self._lbl_estimate.configure(text=f"Tempo estimado: ~{est_v} {unit}  ({accel.upper()})")
 
         self._lbl_warn.configure(text="")
-        # Limpa thumbnail placeholder
         self._thumb_label.configure(image=None, text="")
 
         # Reseta presets e campos
@@ -1519,7 +1469,10 @@ class VideoCompressorApp(ctk.CTk):
         self._trim_start = None
         self._trim_end   = None
         self._lbl_trim.configure(text="Sem recorte")
-        self._chk_h265_var.set(False)
+        self._seg_res.set("Original")
+        self._seg_quality.set("⚡ Rápido")
+        self._max_height = None
+        self._quality    = "fast"
         for btn in self._preset_btns:
             btn.configure(fg_color="transparent")
 
@@ -1556,23 +1509,15 @@ class VideoCompressorApp(ctk.CTk):
                     MIN_VIDEO_KBPS,
                 )
                 if video_kbps < H265_KBPS_THRESHOLD:
-                    warn_parts.append("  💡 H.265 recomendado para essa taxa de compressão.")
-                    self._chk_h265_var.set(True)
+                    warn_parts.append("  💡 H.265 será usado automaticamente para essa taxa de compressão.")
 
             self._lbl_warn.configure(text="  ".join(warn_parts))
 
     def _back(self):
         self._del_thumb()
-        if len(self._queue) > 1:
-            self.input_path = None
-            self.probe = None
-            self._go(_DROP)
-        else:
-            self._queue.clear()
-            self._update_queue_display()
-            self.input_path = None
-            self.probe = None
-            self._go(_DROP)
+        self.input_path = None
+        self.probe = None
+        self._go(_DROP)
 
     def _open_trim_dialog(self):
         if not self.input_path or not self.probe:
@@ -1603,6 +1548,12 @@ class VideoCompressorApp(ctk.CTk):
         self._trim_start = None
         self._trim_end   = None
         self._lbl_trim.configure(text="Sem recorte", text_color="gray")
+
+    def _on_res_change(self, val: str):
+        self._max_height = {"720p": 720, "480p": 480, "360p": 360}.get(val)
+
+    def _on_quality_change(self, val: str):
+        self._quality = "good" if "Melhor" in val else "fast"
 
     def _start_compress(self):
         # Resolve tamanho alvo
@@ -1651,7 +1602,7 @@ class VideoCompressorApp(ctk.CTk):
 
         self._trim_start = trim_start
         self._trim_end   = trim_end
-        self._use_h265   = self._chk_h265_var.get()
+        self._use_h265   = False  # ativado automaticamente em build_command via H265_KBPS_THRESHOLD
 
         self.cancel_evt.clear()
         self._pbar.set(0)
@@ -1660,10 +1611,7 @@ class VideoCompressorApp(ctk.CTk):
         self._lbl_accel.configure(text="")
         self._btn_cancel.configure(text="Cancelar", state="normal")
 
-        # Informação de arquivo atual na fila (#8)
-        q_info = (f"Arquivo {self._queue_idx + 1}/{len(self._queue)}: "
-                  if len(self._queue) > 1 else "")
-        self._lbl_progress_file.configure(text=f"{q_info}{self.input_path.name}")
+        self._lbl_progress_file.configure(text=self.input_path.name)
 
         self._go(_PROGRESS)
 
@@ -1685,6 +1633,8 @@ class VideoCompressorApp(ctk.CTk):
                 use_h265     = self._use_h265,
                 trim_start   = self._trim_start,
                 trim_end     = self._trim_end,
+                max_height   = self._max_height,
+                quality      = self._quality,
             )
             if not self.cancel_evt.is_set():
                 self.after(0, self._on_done, accel)
@@ -1704,46 +1654,18 @@ class VideoCompressorApp(ctk.CTk):
         self._lbl_stats.configure(text=stats)
 
     def _on_done(self, accel_label: str = ""):
-        # Atualiza o label do acelerador (#4)
         self._lbl_accel.configure(text=f"Acelerador: {accel_label}" if accel_label else "")
 
         out_mb = self.tmp_path.stat().st_size / 1048576
         in_mb  = self.probe["size_bytes"] / 1048576
         reduction = int((1 - out_mb / in_mb) * 100)
-        result_line = f"{self.input_path.name}: {in_mb:.1f} MB → {out_mb:.1f} MB ({reduction}% menor)"
-        self._queue_results.append(result_line)
 
-        # Se há mais arquivos na fila, processa o próximo (#8)
-        self._queue_idx += 1
-        if self._queue_idx < len(self._queue):
-            # Salva o arquivo atual automaticamente no mesmo diretório do input
-            auto_dest = self.input_path.parent / f"{self.input_path.stem}_comprimido.mp4"
-            try:
-                shutil.move(str(self.tmp_path), str(auto_dest))
-                self.tmp_path = None
-            except OSError:
-                pass
-            # Carrega próximo arquivo
-            self._load_from_queue()
-            if self.state == _CONFIG:
-                self._start_compress()
-            return
-
-        # Último (ou único) arquivo — vai para DONE
         self._lbl_sizes.configure(
-            text="" if len(self._queue_results) > 1
-            else f"{in_mb:.1f} MB  →  {out_mb:.1f} MB   ({reduction}% menor)"
+            text=f"{in_mb:.1f} MB  →  {out_mb:.1f} MB   ({reduction}% menor)"
         )
-        # Preenche lista de resultados para fila (#8)
         for w in self._results_box.winfo_children():
             w.destroy()
-        if len(self._queue_results) > 1:
-            for i, r in enumerate(self._queue_results):
-                ctk.CTkLabel(
-                    self._results_box, text=r, font=self._f_small, anchor="w",
-                ).grid(row=i, column=0, sticky="ew", padx=6, pady=1)
 
-        # Preenche o campo de salvar com o caminho sugerido
         default_save = self.input_path.parent / f"{self.input_path.stem}_comprimido.mp4"
         self._entry_save_path.delete(0, "end")
         self._entry_save_path.insert(0, str(default_save))
@@ -1809,16 +1731,14 @@ class VideoCompressorApp(ctk.CTk):
     def _reset(self):
         self._del_tmp()
         self._del_thumb()
-        self._queue.clear()
-        self._queue_idx = 0
-        self._queue_results.clear()
-        self._update_queue_display()
         self.input_path   = None
         self.probe        = None
         self.target_bytes = None
         self._saved_path  = None
         self._trim_start  = None
         self._trim_end    = None
+        self._max_height  = None
+        self._quality     = "fast"
         self._entry_save_path.delete(0, "end")
         self._lbl_save_status.configure(text="")
         self._btn_save.configure(text="Salvar", state="normal")
@@ -1914,8 +1834,7 @@ def main():
     if len(sys.argv) > 1:
         p = Path(sys.argv[1])
         if p.exists() and p.suffix.lower() in SUPPORTED_EXT:
-            app.after(150, lambda: app._enqueue(str(p)))
-            app.after(300, app._queue_to_config)
+            app.after(200, lambda: app._load(str(p)))
 
     app.mainloop()
 
